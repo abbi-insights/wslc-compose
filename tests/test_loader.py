@@ -169,3 +169,149 @@ services:
     text = "\n".join(project.warnings)
     assert "privileged" in text
     assert "restart" in text
+
+
+def test_include_single_file_merge_and_precedence(tmp_path):
+    (tmp_path / "base.yaml").write_text(
+        """
+name: from-base
+services:
+  app:
+    image: alpine:3.20
+    ports:
+      - "8080:80"
+    environment:
+      FROM_BASE: yes
+  worker:
+    image: busybox
+networks:
+  appnet: {}
+volumes:
+  appdata: {}
+"""
+    )
+    (tmp_path / "compose.yaml").write_text(
+        """
+include: ./base.yaml
+name: from-root
+services:
+  app:
+    image: alpine:3.21
+    ports:
+      - "9090:80"
+    environment:
+      FROM_ROOT: yes
+"""
+    )
+
+    project = load_project(str(tmp_path / "compose.yaml"))
+
+    assert project.name == "from-root"
+    assert sorted(project.services.keys()) == ["app", "worker"]
+    assert project.services["app"].image == "alpine:3.21"
+    assert [p.to_flag() for p in project.services["app"].ports] == ["9090:80"]
+    assert project.services["app"].environment == {"FROM_BASE": "True", "FROM_ROOT": "True"}
+    assert project.networks["appnet"].name == "from-root_appnet"
+    assert project.volumes["appdata"].name == "from-root_appdata"
+
+
+def test_include_nested(tmp_path):
+    (tmp_path / "leaf.yaml").write_text(
+        """
+services:
+  leaf:
+    image: alpine
+"""
+    )
+    (tmp_path / "middle.yaml").write_text(
+        """
+include: ./leaf.yaml
+services:
+  middle:
+    image: busybox
+"""
+    )
+    (tmp_path / "compose.yaml").write_text(
+        """
+include: ./middle.yaml
+services:
+  root:
+    image: nginx:alpine
+"""
+    )
+
+    project = load_project(str(tmp_path / "compose.yaml"))
+    assert sorted(project.services.keys()) == ["leaf", "middle", "root"]
+
+
+def test_include_cycle_detected(tmp_path):
+    (tmp_path / "a.yaml").write_text(
+        """
+include: ./b.yaml
+services:
+  a:
+    image: alpine
+"""
+    )
+    (tmp_path / "b.yaml").write_text(
+        """
+include: ./a.yaml
+services:
+  b:
+    image: alpine
+"""
+    )
+
+    with pytest.raises(ComposeError, match="include cycle detected"):
+        load_project(str(tmp_path / "a.yaml"))
+
+
+def test_include_missing_file(tmp_path):
+    (tmp_path / "compose.yaml").write_text(
+        """
+include: ./missing.yaml
+services:
+  app:
+    image: alpine
+"""
+    )
+
+    with pytest.raises(ComposeError, match="include file .*missing.yaml.*compose.yaml"):
+        load_project(str(tmp_path / "compose.yaml"))
+
+
+def test_include_mapping_entry_with_path(tmp_path):
+    (tmp_path / "shared.yaml").write_text(
+        """
+services:
+  db:
+    image: postgres:16
+"""
+    )
+    (tmp_path / "compose.yaml").write_text(
+        """
+include:
+  - path: ./shared.yaml
+services:
+  app:
+    image: alpine
+"""
+    )
+
+    project = load_project(str(tmp_path / "compose.yaml"))
+    assert sorted(project.services.keys()) == ["app", "db"]
+
+
+def test_include_unsupported_entry_shape(tmp_path):
+    (tmp_path / "compose.yaml").write_text(
+        """
+include:
+  - bad: ./shared.yaml
+services:
+  app:
+    image: alpine
+"""
+    )
+
+    with pytest.raises(ComposeError, match="unsupported include entry"):
+        load_project(str(tmp_path / "compose.yaml"))

@@ -284,6 +284,110 @@ def _parse_build(value, project_dir: str) -> BuildConfig:
     )
 
 
+def _normalize_include_path(include_path: str, including_file: str) -> str:
+    resolved = os.path.expanduser(include_path)
+    if not os.path.isabs(resolved):
+        resolved = os.path.join(os.path.dirname(including_file), resolved)
+    resolved = os.path.abspath(os.path.normpath(resolved))
+    if not os.path.isfile(resolved):
+        raise ComposeError(
+            f"include file {include_path!r} not found while loading {including_file!r} "
+            f"(resolved to {resolved!r})"
+        )
+    return resolved
+
+
+def _parse_include_entries(value, including_file: str) -> List[str]:
+    if value is None:
+        return []
+
+    entries = [value] if isinstance(value, str) else value
+    if not isinstance(entries, list):
+        raise ComposeError(
+            f"{including_file}: 'include' must be a string or list, got {type(value).__name__}"
+        )
+
+    resolved_paths: List[str] = []
+    for entry in entries:
+        if isinstance(entry, str):
+            resolved_paths.append(_normalize_include_path(entry, including_file))
+            continue
+
+        if isinstance(entry, dict) and "path" in entry:
+            path_value = entry["path"]
+            path_entries = [path_value] if isinstance(path_value, str) else path_value
+            if not isinstance(path_entries, list):
+                raise ComposeError(
+                    f"{including_file}: include entry 'path' must be a string or list, got "
+                    f"{type(path_value).__name__}"
+                )
+            for path_item in path_entries:
+                if not isinstance(path_item, str):
+                    raise ComposeError(
+                        f"{including_file}: include entry path must be a string, got "
+                        f"{type(path_item).__name__}"
+                    )
+                resolved_paths.append(_normalize_include_path(path_item, including_file))
+            continue
+
+        raise ComposeError(
+            f"{including_file}: unsupported include entry {entry!r}; expected a path string "
+            "or a mapping with a 'path' key"
+        )
+
+    return resolved_paths
+
+
+def _deep_merge_compose(base, override):
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = dict(base)
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _deep_merge_compose(merged[key], value)
+            else:
+                merged[key] = value
+        return merged
+    if isinstance(override, list):
+        # Compose files in this loader replace lists on override rather than concatenate.
+        return list(override)
+    return override
+
+
+def _load_compose_with_includes(
+    compose_file: str,
+    loading_stack: Optional[List[str]] = None,
+):
+    compose_file = os.path.abspath(os.path.normpath(compose_file))
+    loading_stack = loading_stack or []
+
+    if compose_file in loading_stack:
+        cycle_chain = " -> ".join(loading_stack + [compose_file])
+        raise ComposeError(f"include cycle detected: {cycle_chain}")
+
+    try:
+        with open(compose_file, encoding="utf-8") as fh:
+            loaded = yaml.safe_load(fh)
+    except FileNotFoundError as exc:
+        raise ComposeError(f"compose file not found: {compose_file!r}") from exc
+    except yaml.YAMLError as exc:
+        raise ComposeError(f"{compose_file}: invalid YAML ({exc})") from exc
+
+    if loaded is None:
+        loaded = {}
+    if not isinstance(loaded, dict):
+        raise ComposeError(f"{compose_file}: expected a mapping at document root")
+
+    merged = {}
+    include_paths = _parse_include_entries(loaded.get("include"), compose_file)
+    for include_path in include_paths:
+        include_doc = _load_compose_with_includes(include_path, loading_stack + [compose_file])
+        merged = _deep_merge_compose(merged, include_doc)
+
+    loaded_without_include = dict(loaded)
+    loaded_without_include.pop("include", None)
+    return _deep_merge_compose(merged, loaded_without_include)
+
+
 def load_project(
     compose_file: str,
     project_name: Optional[str] = None,
@@ -296,8 +400,7 @@ def load_project(
     env = dict(load_dotenv(dotenv_path))
     env.update(os.environ)  # process env wins
 
-    with open(compose_file, encoding="utf-8") as fh:
-        raw = yaml.safe_load(fh)
+    raw = _load_compose_with_includes(compose_file)
     if not isinstance(raw, dict) or "services" not in raw:
         raise ComposeError(f"{compose_file}: no 'services' section found")
     raw = interpolate_tree(raw, env)

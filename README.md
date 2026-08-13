@@ -265,11 +265,16 @@ Show the wslc-compose and wslc versions.
 | `profiles` | service skipped unless its profile is enabled or it is named explicitly |
 | `stdin_open`, `tty` | `-i`, `-t` |
 | `name` (top level) | default project name |
+| `include` (string, list of strings, list of `{path: ...}` entries) | recursively loaded before interpolation; included files are merged in order and the root file wins on conflicts |
 
 Keys that wslc cannot honor yet are **accepted and reported as a warning** instead of
 failing, so your existing files keep working: `restart`, `healthcheck`, `privileged`,
 `cap_add`/`cap_drop`, `devices`, `extra_hosts`, `sysctls`, `secrets`, `configs`, `init`,
 `pid`, `ipc`, `read_only`, `security_opt`, `logging`.
+
+Include merge semantics are intentionally simple and deterministic in this loader:
+`dict` values merge recursively, scalars override scalars, and lists are **replaced**
+by the overriding file (not concatenated).
 
 Rejected with an explicit error (no silent surprise): anonymous volumes
 (`- /data` without a source), references to undeclared networks/volumes, circular
